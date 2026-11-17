@@ -27,92 +27,149 @@ name: Tests
 on:
   pull_request:
   push:
-    branches: [ main ]
-    tags: [ v* ]
+    branches: [main]
+    tags: ['v*']
   repository_dispatch:
-    types: [ 'rnp update' ]
+    types: ['rnp update']
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: '${{ github.workflow }}-${{ github.job }}-${{ github.head_ref || github.ref_name }}'
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-    - name: Setup test matrix
-      id: matrix
-      run: |
-        if [ "${{ github.event.client_payload }}" != "" ]; then
-          echo "matrix=[ '${{ github.event.client_payload.tag }}' ]" >> $GITHUB_OUTPUT;
-        else
-          echo "matrix=[ 'v0.18.1', '' ]" >> $GITHUB_OUTPUT;
-        fi
+      - name: Set up librnp matrix
+        id: matrix
+        # Read the event as data rather than interpolating a dispatch payload into shell code.
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          with open(os.environ['GITHUB_EVENT_PATH'], encoding='utf-8') as stream:
+              event = json.load(stream)
+          refs = ['v0.18.1', '']  # Minimum supported release and upstream default branch.
+          if os.environ['GITHUB_EVENT_NAME'] == 'repository_dispatch':
+              tag = event.get('client_payload', {}).get('tag')
+              if not isinstance(tag, str) or not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+                  raise SystemExit('rnp update requires client_payload.tag in vX.Y.Z form')
+              if tuple(map(int, tag[1:].split('.'))) < (0, 18, 1):
+                  raise SystemExit('librnp versions older than 0.18.1 are unsupported')
+              refs = [tag]
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as stream:
+              stream.write('matrix=' + json.dumps(refs) + '\n')
+          PY
+
   build-and-test:
     needs: prepare
+    name: ${{ matrix.os }} / Python ${{ matrix.python.ver }} / librnp ${{ matrix.rnp || 'HEAD' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
-        python: [ { ver: '3.10', env: 'py310' }, { ver: '3.11', env: 'py311' }, { ver: '3.12', env: 'py312' }, { ver: '3.13', env: 'py313' } ]
-        rnp: ${{ fromJson(needs.prepare.outputs.matrix) }}
+        os: [ubuntu-24.04, macos-15]
+        python:
+          - {ver: '3.10', env: py310}
+          - {ver: '3.11', env: py311}
+          - {ver: '3.12', env: py312}
+          - {ver: '3.13', env: py313}
+        rnp: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      POETRY_NO_INTERACTION: '1'
+      POETRY_VIRTUALENVS_IN_PROJECT: 'true'
 
-    runs-on: ${{ matrix.os }}
     steps:
-    - name: Install packages Ubuntu
-      if: matrix.os == 'ubuntu-latest'
-#     build-essential is preinstalled on GHA; libbz2-dev/zlib1g-dev are not on ubuntu-24.04
-      run: |
-        sudo apt-get install cmake libbotan-2-dev libjson-c-dev libbz2-dev zlib1g-dev
-        echo LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+      - name: Checkout py-rnp
+        uses: actions/checkout@v4
 
-    - name: Install packages MacOS
-      if: matrix.os == 'macos-latest'
-#     Already installed on GHA: cmake make
-      run: |
-        brew install botan json-c
-        echo LD_LIBRARY_PATH="/usr/local/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+      - name: Checkout librnp
+        uses: actions/checkout@v4
+        with:
+          repository: rnpgp/rnp
+          ref: ${{ matrix.rnp }}
+          # Keep native sources separate from the rnp Python package.
+          path: .ci/librnp
+          submodules: recursive
+          persist-credentials: false
 
-    - name: Checkout rnp
-      uses: actions/checkout@v4
-      with:
-        repository: rnpgp/rnp
-        path: rnp
-        submodules: true
-        ref: ${{ matrix.rnp }}
+      - name: Set native library search paths
+        # tox.ini already forwards both loader paths to the test environment.
+        run: |
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/librnp/lib" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$RUNNER_TEMP/librnp/lib" >> "$GITHUB_ENV"
 
-    - name: Configure rnp (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
-#     libbotan-2-dev is Botan 2: default 'botan' backend
-      run:  cmake -B rnp/build -DBUILD_TESTING=OFF -DENABLE_DOC=OFF -DBUILD_SHARED_LIBS=ON rnp
+      - name: Install Ubuntu build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential cmake pkg-config libbotan-2-dev libjson-c-dev libbz2-dev zlib1g-dev
+          echo 'CRYPTO_BACKEND=botan' >> "$GITHUB_ENV"
 
-    - name: Configure rnp (MacOS)
-      if: matrix.os == 'macos-latest'
-#     brew botan is Botan 3: requires the 'botan3' backend (rnp >= 0.17.1)
-      run:  cmake -B rnp/build -DBUILD_TESTING=OFF -DENABLE_DOC=OFF -DBUILD_SHARED_LIBS=ON -DCRYPTO_BACKEND=botan3 rnp
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake pkg-config botan json-c bzip2 zlib
+          echo 'CRYPTO_BACKEND=botan3' >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix):$(brew --prefix bzip2):$(brew --prefix zlib)" >> "$GITHUB_ENV"
 
-    - name: Build rnp
-      run:  cmake --build rnp/build
+      - name: Configure librnp
+        run: |
+          cmake -S .ci/librnp -B "$RUNNER_TEMP/librnp-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/librnp" \
+            -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCRYPTO_BACKEND="$CRYPTO_BACKEND" \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_DOC=OFF \
+            -DBUILD_SHARED_LIBS=ON
 
-    - name: Install rnp
-      run:  sudo cmake --install rnp/build
+      - name: Build and install librnp
+        run: |
+          cmake --build "$RUNNER_TEMP/librnp-build" --parallel 2
+          cmake --install "$RUNNER_TEMP/librnp-build"
 
-    - name: Checkout py-rnp
-      uses: actions/checkout@v4
+      - name: Install Poetry
+        run: pipx install 'poetry==2.3.2'
 
-    - name: Install poetry
-      run: pipx install poetry
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python.ver }}
+          cache: poetry
+          cache-dependency-path: poetry.lock
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python.ver }}
-        cache: 'poetry'
+      - name: Install Python dependencies
+        run: |
+          poetry env use "$(command -v python)"
+          poetry check --lock
+          poetry install --with dev
 
-    - name: Install dependencies
-      run: poetry install
+      - name: Check native library discovery and version
+        run: |
+          # macOS can strip DYLD_* when starting the system shell; set it again here.
+          export DYLD_LIBRARY_PATH="$RUNNER_TEMP/librnp/lib"
+          poetry run python - <<'PY'
+          import rnp
 
-    - name: Test
-      run: poetry run tox -e ${{ matrix.python.env }}
+          print(rnp.version_string_full())
+          assert rnp.version() >= rnp.version_for(0, 18, 1), 'librnp >= 0.18.1 is required'
+          PY
+
+      - name: Run formatting, lint, and tests
+        run: |
+          export DYLD_LIBRARY_PATH="$RUNNER_TEMP/librnp/lib"
+          poetry run tox -e ${{ matrix.python.env }}
